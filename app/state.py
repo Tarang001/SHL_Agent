@@ -10,9 +10,24 @@ from app.conversation_policy import (
     generate_policy_clarification,
     infer_archetype,
     missing_slots,
+    shortlist_bounds,
     should_clarify_slots,
+    should_emit_recommendations,
     should_recommend_slots,
     user_confirmed_done,
+)
+from app.followup import (
+    extract_prior_recommendations,
+    is_followup_query,
+    rebuild_shortlist_from_context,
+    shortlist_likely_issued,
+)
+from app.intent import (
+    classify_intent,
+    intent_to_policy_action,
+    CLARIFICATION_RESPONSE,
+    SUFFICIENT_FOR_RECOMMENDATION,
+    is_explicit_comparison,
 )
 
 RECOMMEND_THRESHOLD = 5
@@ -321,12 +336,17 @@ def is_refusal_needed(text: str) -> Optional[str]:
 
 
 def is_comparison_query(state: dict, messages: list[dict]) -> bool:
+    if state.get("conversation_intent") == "COMPARISON_REQUEST":
+        return True
     if state.get("conversation_goal") == "compare":
         return True
-    return bool(COMPARISON_PATTERNS.search(user_text(messages)))
+    has_prior = bool(state.get("has_recommended") or state.get("recommended_tests"))
+    return is_explicit_comparison(last_user_text(messages), has_prior=has_prior)
 
 
 def is_refinement(state: dict, messages: list[dict]) -> bool:
+    if state.get("post_shortlist_mode") == "refine":
+        return True
     if state.get("conversation_goal") == "refine":
         return True
     if not state.get("has_recommended"):
@@ -652,18 +672,37 @@ def state_confidence_score(state: dict, messages: list[dict]) -> int:
 
 
 def should_recommend(state: dict, messages: list[dict]) -> bool:
-    """True when scenario slots are filled or user approved a proposed stack."""
+    """True when the response should include assessment recommendations."""
     if is_offtopic(last_user_text(messages)):
         return False
     if is_comparison_query(state, messages) and not state.get("has_recommended"):
         return False
-    if user_turn_count(messages) >= 7 and should_recommend_slots(messages, state):
+    if user_turn_count(messages) >= 7 and should_emit_recommendations(messages, state):
         return True
-    return should_recommend_slots(messages, state)
+    return should_emit_recommendations(messages, state)
 
 
 def should_clarify(state: dict, messages: list[dict]) -> bool:
     """True when critical hiring slots are still unfilled."""
+    intent = state.get("conversation_intent", "")
+    if intent in ("COMPARISON_REQUEST", "FOLLOWUP_REASONING", "REFINEMENT_REQUEST", "SUFFICIENT_FOR_RECOMMENDATION"):
+        return False
+    if intent == CLARIFICATION_RESPONSE:
+        from app.intent import has_sufficient_context
+
+        return not has_sufficient_context(messages, state)
+
+    prior = state.get("recommended_tests") or []
+    has_prior = bool(state.get("has_recommendations") or state.get("has_recommended") or prior)
+    if has_prior and is_followup_query(
+        last_user_text(messages), prior, has_recommended=has_prior
+    ):
+        return False
+
+    from app.intent import user_turn_count, FORCE_RECOMMEND_TURN
+
+    if user_turn_count(messages) >= FORCE_RECOMMEND_TURN:
+        return False
     return should_clarify_slots(messages, state)
 
 
@@ -771,6 +810,9 @@ def extract_state(messages: list[dict]) -> dict:
         "needs_clarification": False,
         "turn_count": len(messages),
         "has_recommended": False,
+        "has_recommendations": False,
+        "recommended_tests": [],
+        "last_action": "",
         "explicit_constraints": [],
         "dropped_assessments": [],
         "added_assessments": [],
@@ -780,19 +822,27 @@ def extract_state(messages: list[dict]) -> dict:
         "conversation_archetype": "",
         "conversation_phase": "",
         "missing_hiring_slots": [],
+        "shortlist_min": 1,
+        "shortlist_max": 10,
         "policy_action": "recommend",
     }
 
     full_text = user_text(messages)
     user_text_lower = full_text
 
+    state["recommended_tests"] = []
+    state["has_recommendations"] = False
+    state["has_recommended"] = False
     for m in messages:
-        if m["role"] == "assistant" and (
-            "shl.com" in m["content"]
-            or "recommend" in m["content"].lower()
-            or "assessment" in m["content"].lower()
-        ):
+        if m.get("role") != "assistant":
+            continue
+        if m.get("recommendations"):
             state["has_recommended"] = True
+            break
+        content = m.get("content", "")
+        if len(re.findall(r"https://www\.shl\.com/\S+", content)) >= 2:
+            state["has_recommended"] = True
+            break
 
     for pattern, level in SENIORITY_PATTERNS:
         if re.search(pattern, user_text_lower, re.IGNORECASE):
@@ -903,9 +953,10 @@ def extract_state(messages: list[dict]) -> dict:
     state["conversation_archetype"] = infer_archetype(messages, state)
     state["missing_hiring_slots"] = missing_slots(state["conversation_archetype"], messages, state)
     state["conversation_phase"] = conversation_phase(messages, state)
+    mn, mx = shortlist_bounds(messages, state)
+    state["shortlist_min"] = mn
+    state["shortlist_max"] = mx
     state["confidence_score"] = state_confidence_score(state, messages)
-    state["needs_clarification"] = should_clarify(state, messages)
-    state["policy_action"] = resolve_policy_action(state, messages)
 
     return state
 
@@ -1091,7 +1142,7 @@ def build_search_query(state: dict, messages: list[dict]) -> str:
     return " ".join(p for p in parts if p)
 
 
-def reconstruct_state(messages: list[dict]) -> dict:
+def reconstruct_state(messages: list[dict], retriever=None) -> dict:
     """
     Deterministic full-history state reconstruction (stateless API).
     """
@@ -1133,26 +1184,65 @@ def reconstruct_state(messages: list[dict]) -> dict:
     state["conversation_archetype"] = infer_archetype(messages, state)
     state["missing_hiring_slots"] = missing_slots(state["conversation_archetype"], messages, state)
     state["conversation_phase"] = conversation_phase(messages, state)
+    mn, mx = shortlist_bounds(messages, state)
+    state["shortlist_min"] = mn
+    state["shortlist_max"] = mx
     state["confidence_score"] = state_confidence_score(state, messages)
-    state["needs_clarification"] = should_clarify(state, messages)
+
+    if retriever is not None:
+        attach_recommendation_memory(state, messages, retriever)
+        from app.shortlist_context import post_shortlist_mode
+
+        state["post_shortlist_mode"] = post_shortlist_mode(
+            messages[-1]["content"], messages, state, retriever=retriever
+        )
+    else:
+        state["post_shortlist_mode"] = "none"
+
+    state["conversation_intent"] = classify_intent(messages, state)
     state["policy_action"] = resolve_policy_action(state, messages)
+    state["last_action"] = state["policy_action"]
+    state["needs_clarification"] = should_clarify(state, messages)
     state["_messages"] = messages
 
     return state
 
 
+def attach_recommendation_memory(state: dict, messages: list[dict], retriever) -> dict:
+    """Populate recommended_tests / has_recommendations from conversation history."""
+    prior = extract_prior_recommendations(messages, retriever)
+    if not prior and shortlist_likely_issued(messages, state):
+        prior = rebuild_shortlist_from_context(messages, state, retriever)
+    state["recommended_tests"] = prior
+    state["has_recommendations"] = bool(prior)
+    if prior or shortlist_likely_issued(messages, state):
+        state["has_recommended"] = True
+    return state
+
+
 def resolve_policy_action(state: dict, messages: list[dict]) -> str:
-    """Route conversation: refuse | refine | compare | clarify | recommend."""
-    if is_offtopic(last_user_text(messages)):
+    """
+    Map classified intent to policy action (refuse → compare → refine → clarify → recommend).
+    """
+    intent = state.get("conversation_intent", "")
+    action = intent_to_policy_action(intent)
+
+    if action == "refuse":
         return "refuse"
-    if is_refinement(state, messages):
-        return "refine"
-    if is_comparison_query(state, messages):
+    if action == "compare":
         return "compare"
-    if should_clarify(state, messages):
-        return "clarify"
-    if should_recommend(state, messages):
+    if action == "refine":
+        return "refine"
+    if action == "discuss":
+        return "discuss"
+    if action == "recommend":
         return "recommend"
+    if action == "clarify_or_recommend":
+        from app.intent import has_sufficient_context
+
+        if has_sufficient_context(messages, state):
+            return "recommend"
+        return "clarify"
     return "clarify"
 
 

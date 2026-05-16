@@ -176,8 +176,9 @@ ROLE_FAMILY_BOOST_TERMS = {
 
 ROLE_FAMILY_PENALTY_TERMS = {
     "software_engineering": [
-        "seo", "retail", "contact center", "call simulation", "entry level customer serv",
-        "sales transformation", "medical terminology",
+        "seo", "search engine optimization", "retail", "contact center", "call simulation",
+        "entry level customer serv", "sales transformation", "medical terminology",
+        "marketing", "social media", "copywriting",
     ],
     "contact_center": [
         "core java", "spring", "linux programming", "networking and implementation",
@@ -193,18 +194,21 @@ ROLE_FAMILY_PENALTY_TERMS = {
     "admin_office": ["dependability and safety", "opq mq sales", "contact center"],
 }
 
-# Ideal bundle slots per role family (category -> max count)
+# Per-category caps when building a bundle (totals are capped dynamically by shortlist_max)
 ROLE_BUNDLE_SLOTS = {
-    "software_engineering": {"knowledge": 3, "cognitive": 2, "personality": 1, "simulation": 1},
-    "contact_center": {"simulation": 2, "knowledge": 1, "personality": 1, "cognitive": 1},
-    "sales": {"personality": 2, "cognitive": 1, "development": 2, "knowledge": 1},
-    "graduate": {"cognitive": 2, "personality": 1, "sjt": 2},
-    "leadership": {"personality": 2, "cognitive": 1, "competency": 1},
-    "operations_safety": {"personality": 2, "knowledge": 1, "cognitive": 0},
-    "healthcare": {"knowledge": 3, "personality": 1, "cognitive": 0},
-    "admin_office": {"knowledge": 3, "personality": 1, "simulation": 1},
-    "default": {"knowledge": 2, "cognitive": 2, "personality": 1, "simulation": 1, "sjt": 1},
+    "software_engineering": {"knowledge": 2, "cognitive": 1, "personality": 1, "simulation": 1},
+    "contact_center": {"simulation": 2, "knowledge": 1, "personality": 1},
+    "sales": {"personality": 1, "cognitive": 1, "development": 1, "knowledge": 1},
+    "graduate": {"cognitive": 1, "personality": 1, "sjt": 1},
+    "leadership": {"personality": 2, "competency": 1},
+    "operations_safety": {"personality": 1, "knowledge": 1},
+    "healthcare": {"knowledge": 2, "personality": 1},
+    "admin_office": {"knowledge": 2, "personality": 1, "simulation": 1},
+    "default": {"knowledge": 2, "cognitive": 1, "personality": 1, "sjt": 1},
 }
+
+# Stop adding items when relevance drops below this fraction of the top score
+RELEVANCE_SCORE_FLOOR = 0.52
 
 # Seniority → job_level mapping
 SENIORITY_MAP = {
@@ -503,7 +507,7 @@ class HybridRetriever:
                 score += 12.0
         for term in ROLE_FAMILY_PENALTY_TERMS.get(family, []):
             if term in item_name_lower:
-                score -= 15.0
+                score -= 22.0
 
         if family == "healthcare" and re.search(
             r"\benglish fluent|written work|hybrid\b", user_text, re.I
@@ -553,16 +557,27 @@ class HybridRetriever:
         ranked: list[tuple[float, dict]],
         state: dict,
         user_text: str,
-        limit: int = 10,
+        max_items: int = 10,
+        min_items: int = 1,
     ) -> list[dict]:
-        """Select a role-aware hiring bundle — quality over filler."""
+        """Select only as many grounded items as the scenario needs — no filler to hit a quota."""
+        if not ranked:
+            return []
+
+        max_items = min(10, max(1, max_items))
+        min_items = max(1, min(min_items, max_items))
+        top_score = ranked[0][0] if ranked[0][0] > 0 else 1.0
+        score_floor = top_score * RELEVANCE_SCORE_FLOOR
+
         family = self.infer_role_family(state, user_text)
         slots = ROLE_BUNDLE_SLOTS.get(family, ROLE_BUNDLE_SLOTS["default"])
         selected: list[dict] = []
         category_counts: dict[str, int] = defaultdict(int)
 
-        for _, item in ranked:
-            if len(selected) >= limit:
+        for score, item in ranked:
+            if len(selected) >= max_items:
+                break
+            if score < score_floor and len(selected) >= min_items:
                 break
             cat = _primary_category(item)
             cap = slots.get(cat, 1)
@@ -573,21 +588,7 @@ class HybridRetriever:
             selected.append(item)
             category_counts[cat] += 1
 
-        if len(selected) < min(limit, 5):
-            seen = {i["name"] for i in selected}
-            for score, item in ranked:
-                if len(selected) >= limit:
-                    break
-                if item["name"] in seen:
-                    continue
-                if state.get("exclude_personality") and "personality" in item.get("tags", []):
-                    continue
-                if score < 0.15 and len(selected) >= 3:
-                    break
-                selected.append(item)
-                seen.add(item["name"])
-
-        return selected[:limit]
+        return selected
 
     def category_diversification(
         self, ranked: list[tuple[float, dict]], limit: int = 10
@@ -647,24 +648,28 @@ class HybridRetriever:
             unique.append(rec)
         return unique
 
+    def resolve_catalog_item(self, rec: dict) -> Optional[dict]:
+        """Resolve a recommendation dict to a catalog row — URL first, then name."""
+        if not isinstance(rec, dict):
+            return None
+        url = (rec.get("url") or "").strip()
+        if url and self.is_valid_url(url):
+            for item in self.catalog:
+                if item["url"] == url:
+                    return item
+        name = (rec.get("name") or "").strip()
+        if name:
+            return self.fuzzy_catalog_match(name)
+        return None
+
     def validate_recommendations_against_catalog(self, recommendations: list[dict]) -> list[dict]:
         """Drop any recommendation not grounded in the catalog with canonical fields."""
         valid = []
         for rec in recommendations:
-            if not isinstance(rec, dict):
-                continue
-            name = rec.get("name", "").strip()
-            item = self.fuzzy_catalog_match(name)
+            item = self.resolve_catalog_item(rec)
             if not item:
                 continue
-            url = item["url"]
-            if rec.get("url") and self.is_valid_url(rec["url"]):
-                url = rec["url"]
-            valid.append({
-                "name": item["name"],
-                "url": url,
-                "test_type": ",".join(item["test_types"]),
-            })
+            valid.append(self.catalog_item_to_rec(item))
         return self.deduplicate_recommendations(valid)
 
     def retrieve(self, query: str, state: dict, top_k: int = 20) -> list[dict]:
@@ -690,12 +695,13 @@ class HybridRetriever:
         ranked = self.rank_candidates(query, state, scored_raw)
         pool_size = min(max(top_k * 2, 40), len(ranked))
         pool = ranked[:pool_size]
-        bundled = self.bundle_shortlist(pool, state, user_text, limit=top_k)
-        bundled = self._inject_anchor_items(bundled, state, user_text, pool)
-        if len(bundled) >= min(top_k // 2, 5):
-            return bundled[:top_k]
-        diversified = self.category_diversification(pool, limit=top_k)
-        return self._inject_anchor_items(diversified, state, user_text, pool)[:top_k]
+
+        min_n = int(state.get("shortlist_min", 1))
+        max_n = min(10, max(1, int(state.get("shortlist_max", top_k))))
+
+        bundled = self.bundle_shortlist(pool, state, user_text, max_items=max_n, min_items=min_n)
+        bundled = self._inject_anchor_items(bundled, state, user_text, pool, max_items=max_n)
+        return bundled[:max_n]
 
     def _inject_anchor_items(
         self,
@@ -703,6 +709,7 @@ class HybridRetriever:
         state: dict,
         user_text: str,
         ranked_pool: list[tuple[float, dict]],
+        max_items: int = 10,
     ) -> list[dict]:
         """Promote must-have catalog items for high-confidence role patterns."""
         anchor_substrings = []
@@ -795,7 +802,7 @@ class HybridRetriever:
             if item["name"] not in seen:
                 ordered.append(item)
                 seen.add(item["name"])
-        return ordered
+        return ordered[:max_items]
 
     def recommendations_from_assistant_text(self, text: str) -> list[dict]:
         """Recover prior shortlist names/URLs from assistant turns."""

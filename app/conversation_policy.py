@@ -32,6 +32,20 @@ IMMEDIATE_ARCHETYPES = frozenset({
     "admin_screening",
 })
 
+# Target shortlist size (min, max) learned from gold traces — not a fixed count
+SHORTLIST_BOUNDS: dict[str, tuple[int, int]] = {
+    "leadership_executive": (2, 4),
+    "contact_center": (3, 4),
+    "technical_jd": (4, 8),
+    "safety_plant": (2, 4),
+    "graduate_battery": (2, 4),
+    "sales_audit": (4, 5),
+    "admin_screening": (2, 5),
+    "healthcare_bilingual": (4, 5),
+    "catalog_confirm": (3, 6),
+    "general_broad": (3, 7),
+}
+
 USER_GO_AHEAD_PATTERN = re.compile(
     r"\b("
     r"yes,?\s*go ahead|yes go ahead|go ahead|build (the |a )?shortlist|"
@@ -76,6 +90,29 @@ REFINEMENT_PATTERNS = re.compile(
     re.I,
 )
 
+# Explicit request to (re-)produce a shortlist after one was already given
+RE_RECOMMEND_PATTERNS = re.compile(
+    r"\b("
+    r"recommend|shortlist|suggest (some |an )?assessments?|build (the |a )?shortlist|"
+    r"show (me )?(the )?(tests?|assessments?|stack)|give me (the )?tests?|"
+    r"what (tests?|assessments?) should|update (the )?list|refresh (the )?stack|"
+    r"new stack|revise (the )?stack"
+    r")\b",
+    re.I,
+)
+
+# Follow-up Q&A about tests already discussed — answer in prose only
+INFO_FOLLOWUP_PATTERNS = re.compile(
+    r"\b("
+    r"what is|what are|how long|how much time|duration|tell me (more )?about|explain|"
+    r"why (did you|do you)|can you describe|what does|how does|"
+    r"which (one|test|assessment)|is (this|it|that)|are (these|they)|"
+    r"more (info|information|detail)|what about|how (is|are)|"
+    r"worth (it|using)|should (we|i) (use|include)|pros and cons"
+    r")\b",
+    re.I,
+)
+
 OFFTOPIC_LEGAL = re.compile(
     r"\b(legally required|legal obligation|regulatory requirement|"
     r"does this .+ satisfy)\b",
@@ -84,9 +121,14 @@ OFFTOPIC_LEGAL = re.compile(
 
 
 def _is_comparison(messages: list[dict], state: dict) -> bool:
+    if state.get("conversation_intent") == "COMPARISON_REQUEST":
+        return True
     if state.get("conversation_goal") == "compare":
         return True
-    return bool(COMPARISON_PATTERNS.search(_text(messages)))
+    from app.intent import is_explicit_comparison
+
+    has_prior = bool(state.get("has_recommended") or state.get("recommended_tests"))
+    return is_explicit_comparison(_last(messages), has_prior=has_prior)
 
 
 def _is_refinement(messages: list[dict], state: dict) -> bool:
@@ -318,6 +360,14 @@ def conversation_phase(messages: list[dict], state: dict) -> str:
 
 def should_recommend_slots(messages: list[dict], state: dict) -> bool:
     """Core recommend gate aligned with gold dialogue structure."""
+    from app.intent import FORCE_RECOMMEND_TURN, has_sufficient_context
+
+    if _turns(messages) >= FORCE_RECOMMEND_TURN:
+        return True
+    if state.get("conversation_intent") == "SUFFICIENT_FOR_RECOMMENDATION":
+        return True
+    if state.get("conversation_intent") == "CLARIFICATION_RESPONSE" and has_sufficient_context(messages, state):
+        return True
     if _is_refinement(messages, state):
         return True
 
@@ -343,6 +393,17 @@ def should_recommend_slots(messages: list[dict], state: dict) -> bool:
 
 
 def should_clarify_slots(messages: list[dict], state: dict) -> bool:
+    from app.intent import FORCE_RECOMMEND_TURN
+
+    if _turns(messages) >= FORCE_RECOMMEND_TURN:
+        return False
+    if state.get("conversation_intent") in (
+        "SUFFICIENT_FOR_RECOMMENDATION",
+        "COMPARISON_REQUEST",
+        "FOLLOWUP_REASONING",
+        "REFINEMENT_REQUEST",
+    ):
+        return False
     if _is_offtopic_last(messages):
         return False
     if _is_refinement(messages, state):
@@ -350,6 +411,54 @@ def should_clarify_slots(messages: list[dict], state: dict) -> bool:
     if _is_comparison(messages, state) and not state.get("has_recommended"):
         return False
     return not should_recommend_slots(messages, state)
+
+
+def should_emit_recommendations(messages: list[dict], state: dict) -> bool:
+    """
+    Whether the response should include a recommendations array.
+    Delegates to the core republish rule in shortlist_context.
+    """
+    from app.shortlist_context import should_republish_recommendations
+
+    if state.get("conversation_intent") == "VAGUE_INITIAL_QUERY":
+        return False
+    if should_clarify_slots(messages, state):
+        return False
+    if _is_offtopic_last(messages):
+        return False
+    return should_republish_recommendations(messages, state)
+
+
+def shortlist_bounds(messages: list[dict], state: dict) -> tuple[int, int]:
+    """
+    How many recommendations to return (min, max) for this scenario.
+    Varies by archetype and user constraints — not a fixed bundle size.
+    """
+    archetype = infer_archetype(messages, state)
+    min_n, max_n = SHORTLIST_BOUNDS.get(archetype, (3, 7))
+    text = _text(messages)
+
+    if re.search(r"\b(quick|fast|rapid|lean|minimal|lightweight)\b", text, re.I):
+        max_n = min(max_n, 4)
+        min_n = min(min_n, 2)
+    if re.search(r"\b(full battery|comprehensive|complete stack|all three)\b", text, re.I):
+        max_n = min(10, max_n + 1)
+    if re.search(r"\b(only|just)\s+(two|2|three|3)\b", text, re.I):
+        m = re.search(r"\b(only|just)\s+(two|2|three|3)\b", text, re.I)
+        if m:
+            cap = 2 if "two" in m.group(0).lower() or "2" in m.group(0) else 3
+            max_n = min(max_n, cap)
+            min_n = min(min_n, cap)
+    if state.get("exclude_personality"):
+        max_n = max(min_n, max_n - 1)
+    if state.get("reduce_coding"):
+        max_n = max(min_n, max_n - 2)
+    if state.get("conversation_goal") == "refine" or _is_refinement(messages, state):
+        max_n = min(max_n, 8)
+
+    min_n = max(1, min(min_n, max_n))
+    max_n = min(10, max(1, max_n))
+    return min_n, max_n
 
 
 def user_confirmed_done(messages: list[dict], state: dict) -> bool:
@@ -374,11 +483,13 @@ def next_clarification_for_slot(slot: str, archetype: str, state: dict, messages
             "and is the work mainly inbound calls or blended customer service?"
         ),
         "spoken_language": (
-            "What language should spoken-communication assessments target?"
+            "Before I shape the stack — what language are the calls in? "
+            "That drives which spoken-language screen we use."
         ),
         "english_variant": (
-            "SVAR has multiple English variants (US, UK, Australian, Indian accent). "
-            "Which best matches what your callers will hear?"
+            "SVAR has four English variants in the catalog: US, UK, Australian, and Indian accent. "
+            "The choice matters because the screen is calibrated for the accent your callers will hear. "
+            "Which fits your operation?"
         ),
         "stack_focus": (
             "Is this backend-leaning (Java/Spring/SQL heavy), frontend-heavy, or a balanced full-stack role?"
@@ -411,7 +522,7 @@ def next_clarification_for_slot(slot: str, archetype: str, state: dict, messages
     primary = missing[0]
     secondary = missing[1] if len(missing) > 1 else None
     q1 = prompts.get(primary, prompts["role_specificity"])
-    if secondary and archetype in ("leadership_executive", "technical_jd", "contact_center"):
+    if secondary and archetype in ("leadership_executive", "technical_jd"):
         q2 = prompts.get(secondary, "")
         if q2:
             return f"{q1} Also: {q2.lower()}"
@@ -419,17 +530,52 @@ def next_clarification_for_slot(slot: str, archetype: str, state: dict, messages
 
 
 def generate_policy_clarification(state: dict, messages: list[dict]) -> str:
+    from app.intent import extract_asked_slots, extract_answered_slots
+
     archetype = infer_archetype(messages, state)
     phase = conversation_phase(messages, state)
+    asked = extract_asked_slots(messages)
+    answered = extract_answered_slots(messages, state)
 
     if phase == "proposing":
         return next_clarification_for_slot("user_go_ahead", archetype, state, messages)
 
     if archetype == "leadership_executive" and _turns(messages) == 1:
-        return "Happy to help narrow that down. Who is this meant for?"
+        return "Happy to help narrow that down. Who is this meant for — CXOs and directors, frontline managers, or a mixed leadership pool?"
+
+    missing = missing_slots(archetype, messages, state)
+    for slot in missing:
+        if slot in answered or slot in asked:
+            continue
+        return next_clarification_for_slot(slot, archetype, state, messages)
+
+    domain_questions = {
+        "contact_center": (
+            "What language should spoken-communication assessments target, "
+            "and is the work mainly inbound calls or blended customer service?"
+        ),
+        "technical_jd": (
+            "Is this backend-leaning (Java/Spring/SQL), frontend-heavy, or balanced full-stack — "
+            "and is seniority closer to senior IC or tech lead?"
+        ),
+        "leadership_executive": (
+            "Is this for selection against a benchmark, development for leaders in role, "
+            "or succession planning?"
+        ),
+        "sales_audit": (
+            "Are you re-skilling individual contributors, frontline managers, or a mixed sales population?"
+        ),
+        "general_broad": (
+            "What is the specific role and seniority, and which 2–3 competencies should the stack measure?"
+        ),
+    }
+    if archetype in domain_questions and _turns(messages) <= 3:
+        q = domain_questions[archetype]
+        if q not in " ".join(m.get("content", "") for m in messages if m.get("role") == "assistant"):
+            return q
 
     return next_clarification_for_slot(
-        missing_slots(archetype, messages, state)[0] if missing_slots(archetype, messages, state) else "role_specificity",
+        missing[0] if missing else "role_specificity",
         archetype,
         state,
         messages,

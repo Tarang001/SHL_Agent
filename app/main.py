@@ -35,9 +35,16 @@ async def startup():
 
 # ── Schema ──────────────────────────────────────────────────────────────────
 
+class RecommendationInput(BaseModel):
+    name: str
+    url: str
+    test_type: str = ""
+
+
 class Message(BaseModel):
     role: str  # "user" | "assistant"
     content: str
+    recommendations: Optional[list[RecommendationInput]] = None
 
     @field_validator("role")
     @classmethod
@@ -84,28 +91,32 @@ async def chat(request: ChatRequest):
     if agent is None:
         raise HTTPException(status_code=503, detail="Agent not initialized")
     
-    messages = [{"role": m.role, "content": m.content} for m in request.messages]
+    messages = []
+    for m in request.messages:
+        msg: dict = {"role": m.role, "content": m.content}
+        if m.recommendations:
+            msg["recommendations"] = [
+                {"name": r.name, "url": r.url, "test_type": r.test_type}
+                for r in m.recommendations
+            ]
+        messages.append(msg)
     result = await agent.respond(messages)
     
-    # Programmatic validation — schema must always be correct
+    # Programmatic validation — schema must always be correct; types from catalog only
+    grounded = retriever.validate_recommendations_against_catalog(
+        result.get("recommendations", [])
+    )
     validated_recs = []
-    seen_names = set()
-    for r in result.get("recommendations", []):
-        name = r.get("name", "")
-        url = r.get("url", "")
-        if not name or not url:
+    for r in grounded:
+        if not r.get("name") or not r.get("url"):
             continue
-        if name in seen_names:
+        if not retriever.is_valid_url(r["url"]):
+            logger.warning(f"Rejected hallucinated URL: {r['url']}")
             continue
-        # Verify URL is in catalog
-        if not retriever.is_valid_url(url):
-            logger.warning(f"Rejected hallucinated URL: {url}")
-            continue
-        seen_names.add(name)
         validated_recs.append(Recommendation(
-            name=name,
-            url=url,
-            test_type=r.get("test_type", "")
+            name=r["name"],
+            url=r["url"],
+            test_type=r.get("test_type", ""),
         ))
     
     # Cap at 10
