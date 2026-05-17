@@ -342,5 +342,3 @@ def format_comparison_context(items: list[dict]) -> str:
             f"  summary:{item.get('description', '')[:280]}"
         )
     return "\n".join(blocks)
-
-followup.py
